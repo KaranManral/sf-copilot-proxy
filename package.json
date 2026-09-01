@@ -1,0 +1,14 @@
+{
+  "name": "sf-copilot-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Local proxy translating GitHub Copilot's native Anthropic Messages API to the Salesforce Models API (Bedrock invoke shape) with an auto-refreshed OrgJWT.",
+  "engines": {
+    "node": ">=22.6.0"
+  },
+  "scripts": {
+    "start": "node src/server.ts",
+    "dev": "node --watch src/server.ts"
+  }
+}
