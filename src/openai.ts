@@ -25,19 +25,52 @@ function messageContentToString(content: unknown): string {
 }
 
 export function toGenerationsBody(incoming: any, alias: string): any {
-  const messages = Array.isArray(incoming.messages)
-    ? incoming.messages.map((m: any) => {
-        const out: any = { role: m.role, content: messageContentToString(m.content) };
-        // SF's schema names assistant tool calls `tool_invocations`, not the
-        // OpenAI `tool_calls`. Without the rename, SF drops the field and the
-        // following `tool` message has no antecedent -> 400 ("must be a response
-        // to ... tool_calls"). Field shape is otherwise identical.
-        if (Array.isArray(m.tool_calls)) out.tool_invocations = m.tool_calls;
-        if (m.tool_call_id != null) out.tool_call_id = m.tool_call_id;
-        if (m.name != null) out.name = m.name;
-        return out;
-      })
-    : [];
+  const srcMessages: any[] = Array.isArray(incoming.messages) ? incoming.messages : [];
+
+  // The `tool` message the extension emits carries `tool_call_name` (the name of
+  // the function that was called). Copilot's OpenAI `tool` messages usually omit
+  // the name, so recover it from the antecedent assistant tool call by id.
+  const idToName = new Map<string, string>();
+  for (const m of srcMessages) {
+    if (Array.isArray(m?.tool_calls)) {
+      for (const tc of m.tool_calls) {
+        if (tc?.id != null && tc?.function?.name != null) {
+          idToName.set(String(tc.id), String(tc.function.name));
+        }
+      }
+    }
+  }
+
+  // Mirror the extension's /chat/generations message shape exactly (TTa):
+  //   assistant tool call -> {role, content, tool_invocations:[{id, function:{name, arguments}}]}
+  //   tool result         -> {role:"tool", content, tool_call_id, tool_call_name}
+  // Passing OpenAI's `tool_calls` verbatim (with extra `type`/`index`) makes SF
+  // fail to translate it into `tool_calls`, so the following `tool` message has
+  // no antecedent -> "must be a response to a preceding message with tool_calls".
+  const messages = srcMessages.map((m: any) => {
+    const out: any = { role: m.role, content: messageContentToString(m.content) };
+    if (Array.isArray(m.tool_calls) && m.tool_calls.length > 0) {
+      out.tool_invocations = m.tool_calls.map((tc: any) => ({
+        id: tc.id,
+        function: {
+          name: tc.function?.name,
+          arguments:
+            typeof tc.function?.arguments === "string"
+              ? tc.function.arguments
+              : JSON.stringify(tc.function?.arguments ?? {}),
+        },
+      }));
+    }
+    if (m.role === "tool") {
+      if (m.tool_call_id != null) out.tool_call_id = m.tool_call_id;
+      const name =
+        m.tool_call_name ??
+        m.name ??
+        (m.tool_call_id != null ? idToName.get(String(m.tool_call_id)) : undefined);
+      if (name != null) out.tool_call_name = name;
+    }
+    return out;
+  });
 
   const gs: Record<string, unknown> = {};
   if (incoming.max_tokens != null) gs.max_tokens = incoming.max_tokens;
@@ -55,9 +88,11 @@ export function toGenerationsBody(incoming: any, alias: string): any {
     model: alias,
     system_prompt_strategy: "use_model_parameter",
   };
-  // Pass through tool definitions so the model can emit new tool calls.
-  if (Array.isArray(incoming.tools)) body.tools = incoming.tools;
-  if (incoming.tool_choice != null) body.tool_choice = incoming.tool_choice;
+  // Tool definitions: the extension sends {type:"function", function:{name,
+  // description, parameters}} — the same shape Copilot's OpenAI provider emits —
+  // so pass them through. The extension does NOT send `tool_choice` on this
+  // path, so omit it rather than forward an unsupported field.
+  if (Array.isArray(incoming.tools) && incoming.tools.length > 0) body.tools = incoming.tools;
   return body;
 }
 

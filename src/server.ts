@@ -9,14 +9,28 @@ import { createServer, IncomingMessage, ServerResponse } from "node:http";
 import { config, resolveModel, resolveGptModel, MODEL_MAP, GPT_MODEL_MAP } from "./config.ts";
 import { TokenProvider } from "./token.ts";
 import { EventStreamDecoder, extractAnthropicEvent } from "./eventstream.ts";
+// FALLBACK PATH (/chat/generations): kept importable so the GPT handler can be
+// reverted by swapping handleChatCompletions back to the generations version
+// below. This path does NOT support reasoning (reasoning_effort is a no-op).
 import {
   toGenerationsBody,
   toOpenAICompletion,
   SseBlockParser,
   sfBlockToOpenAIDelta,
   isSfDone,
-  openAIChunk,
+  openAIChunk as openAIChunkGen,
 } from "./openai.ts";
+// ACTIVE PATH (/responses): the OpenAI Responses API the Vibes extension uses
+// for GPT on non-gov orgs. Reasoning-capable (honors reasoning:{effort}).
+import {
+  toResponsesBody,
+  responsesToOpenAICompletion,
+  ResponsesSseParser,
+  ResponsesStreamTranslator,
+  openAIChunk,
+  normalizeNativeResponsesBody,
+  classifyResponsesBlock,
+} from "./responses.ts";
 
 const tokens = new TokenProvider(config.instanceUrl, config.clientId, config.clientSecret);
 
@@ -61,6 +75,53 @@ function stripThinkingFromMessages(messages: any): any {
   return out;
 }
 
+// Map an Anthropic `budget_tokens` value to an effort level. Copilot sends the
+// native `thinking:{type:"enabled",budget_tokens:N}` shape, but this org's
+// Bedrock backend rejects "enabled" ("... is not supported for this model. Use
+// thinking.type.adaptive and output_config.effort ..."). So translate the
+// budget into a coarse effort tier the backend accepts.
+function budgetToEffort(budget: number | undefined): "low" | "medium" | "high" {
+  if (budget == null) return "medium";
+  if (budget <= 2048) return "low";
+  if (budget <= 8192) return "medium";
+  return "high";
+}
+
+// Normalize the `thinking` config so a STRIP_THINKING=0 run sends the shape this
+// org's models accept (verified by live test):
+//   - "enabled" is rejected -> translate to {type:"adaptive"} + output_config.effort
+//     (effort derived from budget_tokens; an explicit output_config wins).
+//   - "adaptive" passes through (with optional display).
+//   - "disabled"/absent: no thinking.
+//   - when thinking is active, the backend rejects temperature/top_k/top_p -> drop.
+function normalizeThinking(body: any): void {
+  const t = body.thinking;
+  const type = t?.type;
+  const active = type === "enabled" || type === "adaptive";
+  if (!active) {
+    // "disabled" is a valid explicit value; anything else is dropped entirely.
+    if (type === "disabled") body.thinking = { type: "disabled" };
+    else delete body.thinking;
+    return;
+  }
+
+  if (type === "enabled") {
+    const effort = budgetToEffort(t.budget_tokens);
+    body.thinking = { type: "adaptive" };
+    // Respect a caller-supplied effort; otherwise derive from the budget.
+    body.output_config = { ...body.output_config };
+    if (body.output_config.effort == null) body.output_config.effort = effort;
+  } else {
+    const normalized: any = { type: "adaptive" };
+    if (t.display != null) normalized.display = t.display;
+    body.thinking = normalized;
+  }
+
+  delete body.temperature;
+  delete body.top_k;
+  delete body.top_p;
+}
+
 // Build the Salesforce body from the incoming native Anthropic body.
 function toBedrockBody(incoming: any): { body: any; stream: boolean } {
   const stream = incoming.stream === true;
@@ -71,6 +132,11 @@ function toBedrockBody(incoming: any): { body: any; stream: boolean } {
   if (config.stripThinking) {
     delete body.thinking;
     body.messages = stripThinkingFromMessages(body.messages);
+  } else {
+    // Mirror the extension: normalize thinking + sampling params. History
+    // thinking/redacted_thinking blocks are preserved as-is (the extension
+    // re-sends them with their signatures), so we do NOT strip messages here.
+    normalizeThinking(body);
   }
   return { body, stream };
 }
@@ -108,6 +174,27 @@ async function handleMessages(req: IncomingMessage, res: ServerResponse): Promis
   console.log(
     `[req] /v1/messages model=${requestedModel} -> ${alias} stream=${stream} msgs=${Array.isArray(incoming.messages) ? incoming.messages.length : 0}`,
   );
+  // TEMP DIAG: what extra fields/blocks does Copilot send on complex turns?
+  try {
+    const topKeys = Object.keys(incoming).sort().join(",");
+    const blockTypes = new Set<string>();
+    let systemShape = "none";
+    if (typeof incoming.system === "string") systemShape = "string";
+    else if (Array.isArray(incoming.system)) systemShape = `array[${incoming.system.length}]`;
+    for (const m of incoming.messages || []) {
+      if (Array.isArray(m.content)) for (const b of m.content) blockTypes.add(b?.type || "?");
+      else if (typeof m.content === "string") blockTypes.add("string");
+    }
+    const toolsInfo = Array.isArray(incoming.tools) ? `tools=${incoming.tools.length}` : "tools=0";
+    console.log(
+      `[diag] keys=[${topKeys}] system=${systemShape} ${toolsInfo} tool_choice=${JSON.stringify(incoming.tool_choice) || "none"} blocks=[${[...blockTypes].join(",")}] bodyBytes=${JSON.stringify(body).length}`,
+    );
+    // Outgoing thinking normalization: compare what Copilot sent vs what we
+    // forward to Bedrock, so a thinking-enabled test is easy to read.
+    console.log(
+      `[diag] thinking in=${JSON.stringify(incoming.thinking) || "none"} out=${JSON.stringify(body.thinking) || "none"} max_tokens in=${incoming.max_tokens} out=${body.max_tokens} temp=${body.temperature ?? "dropped"} stripThinking=${config.stripThinking}`,
+    );
+  } catch {}
   const token = await tokens.get();
   const path = stream ? "invoke-with-response-stream" : "invoke";
   const url = `${config.modelsBaseUrl}/model/${alias}/${path}`;
@@ -244,7 +331,26 @@ async function handleMessages(req: IncomingMessage, res: ServerResponse): Promis
   }
 }
 
-// OpenAI Chat Completions -> Salesforce /chat/generations (GPT models).
+// Guard: a Claude/Anthropic model arriving on the OpenAI endpoint means Copilot
+// registered it under the wrong API type. Shared by both GPT handlers.
+function rejectAnthropicOnOpenAI(requestedModel: string, res: ServerResponse): boolean {
+  if (!/claude|anthropic/i.test(requestedModel)) return false;
+  console.error(
+    `[proxy] REJECT: Anthropic model "${requestedModel}" sent to the OpenAI endpoint. In Copilot, register this model under the Anthropic Messages API type (it uses /v1/messages), not OpenAI.`,
+  );
+  sendJson(res, 400, {
+    error: {
+      type: "invalid_request_error",
+      message: `Model "${requestedModel}" is a Claude/Anthropic model and must use the Anthropic Messages API (/v1/messages), not the OpenAI Chat Completions endpoint. In Copilot's model settings, add this model with API type "Anthropic", not "OpenAI".`,
+    },
+  });
+  return true;
+}
+
+// OpenAI Chat Completions -> Salesforce /responses (GPT models).
+// This is the reasoning-capable path the Vibes extension uses for GPT on
+// non-gov orgs. To revert to the non-reasoning /chat/generations path, swap the
+// call in the router to handleChatCompletionsViaGenerations below.
 async function handleChatCompletions(req: IncomingMessage, res: ServerResponse): Promise<void> {
   let incoming: any;
   try {
@@ -256,23 +362,219 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
   const requestedModel = String(incoming.model || "");
   const alias = resolveGptModel(requestedModel);
   const stream = incoming.stream === true;
+  const effort =
+    typeof incoming.reasoning_effort === "string"
+      ? incoming.reasoning_effort
+      : incoming.reasoning?.effort;
   console.log(
-    `[req] /v1/chat/completions model=${requestedModel} -> ${alias} stream=${stream} msgs=${Array.isArray(incoming.messages) ? incoming.messages.length : 0}`,
+    `[req] /v1/chat/completions model=${requestedModel} -> ${alias} stream=${stream} msgs=${Array.isArray(incoming.messages) ? incoming.messages.length : 0} effort=${effort ?? "none"} path=/responses`,
   );
-  // A Claude/Anthropic model arriving here means Copilot registered it under the
-  // wrong API type (OpenAI instead of Anthropic). /chat/generations only serves
-  // GPT; a Claude alias would 400 or silently misbehave. Fail loudly instead.
-  if (/claude|anthropic/i.test(requestedModel)) {
-    console.error(
-      `[proxy] REJECT: Anthropic model "${requestedModel}" sent to the OpenAI endpoint. In Copilot, register this model under the Anthropic Messages API type (it uses /v1/messages), not OpenAI.`,
-    );
-    return sendJson(res, 400, {
-      error: {
-        type: "invalid_request_error",
-        message: `Model "${requestedModel}" is a Claude/Anthropic model and must use the Anthropic Messages API (/v1/messages), not the OpenAI Chat Completions endpoint. In Copilot's model settings, add this model with API type "Anthropic", not "OpenAI".`,
-      },
+  if (rejectAnthropicOnOpenAI(requestedModel, res)) return;
+
+  const body = toResponsesBody(incoming, alias);
+  const token = await tokens.get();
+  const url = `${config.modelsBaseUrl}/responses`;
+
+  const upstream = await fetch(url, {
+    method: "POST",
+    headers: sfHeaders(token),
+    body: JSON.stringify(stream ? { ...body, stream: true } : body),
+  });
+
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => "");
+    console.error(`[proxy] gpt upstream ${upstream.status} for ${alias}: ${text.slice(0, 200)}`);
+    return sendJson(res, upstream.status, {
+      error: { type: "api_error", message: `Salesforce Models API ${upstream.status}: ${text.slice(0, 500)}` },
     });
   }
+
+  if (!stream) {
+    const json = await upstream.json();
+    return sendJson(res, 200, responsesToOpenAICompletion(json, requestedModel));
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  const parser = new ResponsesSseParser();
+  const translator = new ResponsesStreamTranslator();
+  const reader = upstream.body!.getReader();
+  const decoder = new TextDecoder();
+  const chunkId = `chatcmpl-${Date.now().toString(36)}`;
+  const created = Math.floor(Date.now() / 1000);
+  let sentRole = false;
+  let finishSent = false;
+
+  const flushFinish = (reason: string) => {
+    if (finishSent) return;
+    finishSent = true;
+    res.write(openAIChunk(chunkId, requestedModel, created, {}, reason));
+    res.write("data: [DONE]\n\n");
+  };
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const block of parser.push(decoder.decode(value, { stream: true }))) {
+        // Surface an in-band error event (Responses streams errors with 200).
+        if (block.event === "error" || block.event === "response.failed") {
+          console.error(`[proxy] gpt stream error frame for ${alias}: ${block.data.slice(0, 500)}`);
+        }
+        for (const delta of translator.translate(block)) {
+          if (!sentRole) {
+            (delta as any).role = "assistant";
+            sentRole = true;
+          }
+          res.write(openAIChunk(chunkId, requestedModel, created, delta, null));
+        }
+        const finish = translator.finishReason(block);
+        if (finish) flushFinish(finish);
+      }
+    }
+    if (!translator.sawContent) {
+      console.error(`[proxy] gpt stream for ${alias} produced no content (empty response)`);
+    }
+    // Safety net if the upstream ended without a response.completed event.
+    flushFinish("stop");
+  } catch (err) {
+    console.error("[proxy] gpt stream error:", err);
+    if (!finishSent) flushFinish("stop");
+  } finally {
+    res.end();
+  }
+}
+
+// Native OpenAI Responses API -> Salesforce /responses (GPT models).
+// This is the forward-looking path: Copilot (or the Vibes extension) speaks the
+// Responses wire format directly (`{model, input:[...], reasoning?, tools?}`),
+// so this is a near-passthrough — we only remap the model alias and drop
+// sampling params reasoning models reject. Streaming forwards SF's `response.*`
+// SSE frames verbatim (no chat.completion.chunk translation), which lets Copilot
+// render reasoning summaries natively. Intended to eventually replace the
+// chat-completions handler.
+async function handleResponses(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  let incoming: any;
+  try {
+    incoming = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: { type: "invalid_request_error", message: "invalid JSON body" } });
+  }
+
+  const requestedModel = String(incoming.model || "");
+  const alias = resolveGptModel(requestedModel);
+  const stream = incoming.stream === true;
+  const effort = incoming.reasoning?.effort;
+  console.log(
+    `[req] /v1/responses model=${requestedModel} -> ${alias} stream=${stream} input=${Array.isArray(incoming.input) ? incoming.input.length : 0} effort=${effort ?? "none"} path=/responses(native)`,
+  );
+  if (rejectAnthropicOnOpenAI(requestedModel, res)) return;
+
+  const body = normalizeNativeResponsesBody(incoming, alias);
+  const token = await tokens.get();
+  const url = `${config.modelsBaseUrl}/responses`;
+
+  const upstream = await fetch(url, {
+    method: "POST",
+    headers: sfHeaders(token),
+    body: JSON.stringify(stream ? { ...body, stream: true } : body),
+  });
+
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => "");
+    console.error(`[proxy] responses upstream ${upstream.status} for ${alias}: ${text.slice(0, 200)}`);
+    return sendJson(res, upstream.status, {
+      error: { type: "api_error", message: `Salesforce Models API ${upstream.status}: ${text.slice(0, 500)}` },
+    });
+  }
+
+  if (!stream) {
+    // Non-stream: SF returns a Responses object; forward it verbatim — the
+    // client already speaks Responses.
+    const json = await upstream.json();
+    return sendJson(res, 200, json);
+  }
+
+  res.writeHead(200, {
+    "Content-Type": "text/event-stream",
+    "Cache-Control": "no-cache",
+    Connection: "keep-alive",
+  });
+
+  const parser = new ResponsesSseParser();
+  const reader = upstream.body!.getReader();
+  const decoder = new TextDecoder();
+  let sawContent = false;
+  let errored = false;
+
+  try {
+    while (true) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      for (const block of parser.push(decoder.decode(value, { stream: true }))) {
+        const { sawContent: c, errored: e } = classifyResponsesBlock(block);
+        if (c) sawContent = true;
+        if (e) {
+          errored = true;
+          console.error(`[proxy] responses stream error frame for ${alias}: ${block.data.slice(0, 500)}`);
+        }
+        // Forward the frame verbatim (re-serialize event + data lines).
+        res.write(`event: ${block.event}\n`);
+        for (const line of block.data.split("\n")) res.write(`data: ${line}\n`);
+        res.write("\n");
+      }
+    }
+    if (!sawContent && !errored) {
+      console.error(`[proxy] responses stream for ${alias} ended with no content (empty response)`);
+      res.write("event: error\n");
+      res.write(
+        `data: ${JSON.stringify({ type: "error", error: { type: "api_error", message: "Salesforce Models API returned an empty stream (no content)" } })}\n\n`,
+      );
+    }
+  } catch (err) {
+    console.error("[proxy] responses stream error:", err);
+    if (!res.writableEnded) {
+      res.write("event: error\n");
+      res.write(
+        `data: ${JSON.stringify({ type: "error", error: { type: "api_error", message: String((err as any)?.message || err) } })}\n\n`,
+      );
+    }
+  } finally {
+    res.end();
+  }
+}
+
+// ---------------------------------------------------------------------------
+// FALLBACK: OpenAI Chat Completions -> Salesforce /chat/generations (GPT models).
+// This path works but does NOT support reasoning (reasoning_effort is silently
+// ignored -> 0 reasoning tokens). Kept as a drop-in replacement: point the
+// router at handleChatCompletionsViaGenerations to re-enable it if /responses
+// regresses. Uses the openai.ts helpers (toGenerationsBody/toOpenAICompletion/
+// SseBlockParser/sfBlockToOpenAIDelta/isSfDone/openAIChunkGen).
+// ---------------------------------------------------------------------------
+async function handleChatCompletionsViaGenerations(
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  let incoming: any;
+  try {
+    incoming = JSON.parse(await readBody(req));
+  } catch {
+    return sendJson(res, 400, { error: { type: "invalid_request_error", message: "invalid JSON body" } });
+  }
+
+  const requestedModel = String(incoming.model || "");
+  const alias = resolveGptModel(requestedModel);
+  const stream = incoming.stream === true;
+  console.log(
+    `[req] /v1/chat/completions model=${requestedModel} -> ${alias} stream=${stream} msgs=${Array.isArray(incoming.messages) ? incoming.messages.length : 0} path=/chat/generations`,
+  );
+  if (rejectAnthropicOnOpenAI(requestedModel, res)) return;
+
   const body = toGenerationsBody(incoming, alias);
   const token = await tokens.get();
   const path = stream ? "chat/generations/stream" : "chat/generations";
@@ -315,7 +617,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
   const flushFinish = (reason: string) => {
     if (finishSent) return;
     finishSent = true;
-    res.write(openAIChunk(chunkId, requestedModel, created, {}, reason));
+    res.write(openAIChunkGen(chunkId, requestedModel, created, {}, reason));
     res.write("data: [DONE]\n\n");
   };
 
@@ -328,7 +630,6 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
           flushFinish("stop");
           continue;
         }
-        // Surface an in-band error frame (SF may stream an error event with 200).
         if (block.event === "error" || /"errorCode"|"error"\s*:/.test(block.data)) {
           console.error(`[proxy] gpt stream error frame for ${alias}: ${block.data.slice(0, 500)}`);
         }
@@ -343,7 +644,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
             delta.role = "assistant";
             sentRole = true;
           }
-          res.write(openAIChunk(chunkId, requestedModel, created, delta, null));
+          res.write(openAIChunkGen(chunkId, requestedModel, created, delta, null));
         }
         if (d.finish) flushFinish(d.finish);
       }
@@ -351,7 +652,6 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
     if (!sawContent) {
       console.error(`[proxy] gpt stream for ${alias} produced no content (empty response)`);
     }
-    // Safety net if the upstream ended without an explicit [DONE].
     flushFinish("stop");
   } catch (err) {
     console.error("[proxy] gpt stream error:", err);
@@ -415,13 +715,30 @@ const server = createServer(async (req, res) => {
     }
   }
 
+  if (method === "POST" && (url === "/v1/responses" || url === "/responses")) {
+    if (!authorized(req)) {
+      return sendJson(res, 401, { error: { type: "authentication_error", message: "bad proxy key" } });
+    }
+    try {
+      return await handleResponses(req, res);
+    } catch (err: any) {
+      console.error("[proxy] responses handler error:", err);
+      if (!res.headersSent) {
+        return sendJson(res, 500, { error: { type: "api_error", message: String(err?.message || err) } });
+      }
+      res.end();
+      return;
+    }
+  }
+
   sendJson(res, 404, { type: "error", error: { type: "not_found_error", message: `no route for ${method} ${url}` } });
 });
 
 server.listen(config.port, config.host, () => {
   console.log(`sf-copilot-proxy listening on http://${config.host}:${config.port}`);
   console.log(`  /v1/messages         -> ${config.modelsBaseUrl}/model/<alias>/invoke[-with-response-stream]`);
-  console.log(`  /v1/chat/completions -> ${config.modelsBaseUrl}/chat/generations[/stream]`);
+  console.log(`  /v1/chat/completions -> ${config.modelsBaseUrl}/responses (reasoning-capable; /chat/generations kept as fallback)`);
+  console.log(`  /v1/responses        -> ${config.modelsBaseUrl}/responses (native Responses passthrough)`);
   console.log(`  anthropic models: ${Object.keys(MODEL_MAP).join(", ")}`);
   console.log(`  openai models: ${Object.keys(GPT_MODEL_MAP).join(", ")}`);
   console.log(`  auth: ${config.proxyKey ? "PROXY_API_KEY required" : "OPEN (no PROXY_API_KEY set)"}`);
