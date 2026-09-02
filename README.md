@@ -2,15 +2,26 @@
 
 A tiny local HTTP proxy that lets **GitHub Copilot** use the **Salesforce Models
 API** — both the **Claude** models (via the native Anthropic Messages API) and
-the Salesforce-hosted **OpenAI/GPT** models (via the OpenAI Chat Completions
-API). It exposes two endpoints:
+the Salesforce-hosted **OpenAI/GPT** models (via the OpenAI Responses API or
+Chat Completions API). It exposes three endpoints:
 
 - `POST /v1/messages` — Anthropic Messages → Salesforce Bedrock *invoke* path
   (Claude models).
+- `POST /v1/responses` — OpenAI **Responses** API → Salesforce `/responses`
+  path (GPT models). Near-passthrough: the client already speaks Responses, so
+  the proxy only remaps the model alias and sanitizes params. This is the
+  **reasoning-capable, forward-looking** path and is intended to eventually
+  replace chat-completions.
 - `POST /v1/chat/completions` — OpenAI Chat Completions → Salesforce
-  *chat/generations* path (GPT models). These GPT models are **not** on Bedrock;
-  they route through the Geo-aware `/chat/generations` endpoint, which has a
-  different request/response shape the proxy translates in both directions.
+  `/responses` path (GPT models). The proxy translates the chat-completions
+  wire shape into `/responses` and back. Also reasoning-capable. The older
+  `/chat/generations` translation is kept in the code as a revertible fallback
+  (`handleChatCompletionsViaGenerations`) but is **not** wired to a route —
+  note it does **not** support reasoning (`reasoning_effort` is a no-op there).
+
+These GPT models are **not** on Bedrock; they route through the Geo-aware
+`/responses` endpoint, which has a different request/response shape the proxy
+translates in both directions.
 
 It bridges the incompatibilities that block Copilot's built-in BYOK from
 talking to Salesforce directly:
@@ -121,17 +132,23 @@ curl -s -X POST http://127.0.0.1:8787/v1/messages \
 In VS Code: **Copilot Chat → model picker → Manage Models… → Add model → Custom
 Endpoint**. Add the proxy once per API type you want to use:
 
-| Field           | Claude models                       | GPT models                                |
-|-----------------|-------------------------------------|-------------------------------------------|
-| Base URL / URL  | `http://127.0.0.1:8787`             | `http://127.0.0.1:8787`                   |
-| API type        | Anthropic Messages (`/v1/messages`) | OpenAI-compatible (`/v1/chat/completions`)|
-| API key         | your `PROXY_API_KEY`                | your `PROXY_API_KEY`                      |
-| Model id        | e.g. `claude-sonnet-5`              | e.g. `gpt-5.4`                            |
+| Field           | Claude models                       | GPT models (recommended)      | GPT models (legacy)                       |
+|-----------------|-------------------------------------|-------------------------------|-------------------------------------------|
+| Base URL / URL  | `http://127.0.0.1:8787`             | `http://127.0.0.1:8787`       | `http://127.0.0.1:8787`                   |
+| API type        | Anthropic Messages (`/v1/messages`) | Responses (`/v1/responses`)   | OpenAI-compatible (`/v1/chat/completions`)|
+| API key         | your `PROXY_API_KEY`                | your `PROXY_API_KEY`          | your `PROXY_API_KEY`                      |
+| Model id        | e.g. `claude-sonnet-5`              | e.g. `gpt-5.4`                | e.g. `gpt-5.4`                            |
 
 The exact field names shift between Copilot versions; what matters is the
-localhost base URL, the API type (Anthropic vs OpenAI), and the key. Both
-endpoints share the same base URL and key — Copilot picks the path from the
-API type you select.
+localhost base URL, the API type, and the key. All endpoints share the same
+base URL and key — Copilot picks the path from the API type you select.
+
+**Which GPT API type to pick.** Prefer **Responses** (`/v1/responses`): it is a
+near-passthrough, supports reasoning, and lets Copilot render reasoning
+summaries natively. Chat Completions still works and is also reasoning-capable
+via the proxy, but carries only a reasoning-token count, not the reasoning
+content. Both GPT paths reach the same Salesforce `/responses` backend, so you
+can register both and A/B them.
 
 ### `chatLanguageModels.json` examples
 
@@ -166,14 +183,16 @@ value must match `PROXY_API_KEY` in `.env`.
 }
 ```
 
-#### Salesforce OpenAI-compatible models
+#### Salesforce OpenAI GPT models — Responses API (recommended)
+
+Set `"apiType": "responses"` so Copilot posts to `/v1/responses`:
 
 ```json
 {
   "name": "SF_OpenAI",
   "vendor": "customendpoint",
   "apiKey": ".env_apikey",
-  "apiType": "chat-completions",
+  "apiType": "responses",
   "models": [
     {
       "id": "sfdc_ai__DefaultGPT56Luna",
@@ -187,6 +206,10 @@ value must match `PROXY_API_KEY` in `.env`.
   ]
 }
 ```
+
+To use the legacy Chat Completions path instead, keep the same block but set
+`"apiType": "chat-completions"` (Copilot then posts to `/v1/chat/completions`).
+Both reach the same Salesforce `/responses` backend through the proxy.
 
 These are array elements, not a complete file. Keep the existing Copilot
 provider entry and add both objects inside the top-level JSON array. Model IDs
@@ -208,7 +231,7 @@ the thinking/beta flags and are intentionally omitted):
 You can also send a full `sfdc_ai__…` alias directly — it passes through
 unchanged. Edit `MODEL_MAP` in `src/config.ts` to add or rename entries.
 
-### OpenAI / GPT models (send to `/v1/chat/completions`)
+### OpenAI / GPT models (send to `/v1/responses` or `/v1/chat/completions`)
 
 | Model id (send this) | Routes to Salesforce alias      |
 |----------------------|---------------------------------|
@@ -224,7 +247,32 @@ unchanged. Edit `MODEL_MAP` in `src/config.ts` to add or rename entries.
 Full `sfdc_ai__DefaultGPT*` aliases pass through unchanged. Edit `GPT_MODEL_MAP`
 in `src/config.ts` to add or rename entries. Note the alias prefix decides
 routing: `sfdc_ai__DefaultBedrockAnthropic*` uses the Bedrock invoke path,
-`sfdc_ai__DefaultGPT*` uses `/chat/generations`.
+`sfdc_ai__DefaultGPT*` uses `/responses`.
+
+### Reasoning effort (GPT models)
+
+Both GPT paths honor reasoning. On `/v1/responses` send
+`reasoning: { effort: "<level>" }`; on `/v1/chat/completions` send either
+`reasoning_effort: "<level>"` or `reasoning: { effort: "<level>" }`. Reasoning
+tokens scale up with the level and are returned in the usage details.
+
+Verified against the Salesforce `/responses` backend (gpt-5.4, and
+gpt-5.6 luna/terra/sol):
+
+| Level    | Backend support | Notes                                                        |
+|----------|-----------------|--------------------------------------------------------------|
+| `none`   | ✅              | No reasoning; sampling params (`temperature`/`top_p`) allowed. |
+| `low`    | ✅              | Reasoning tokens emitted.                                     |
+| `medium` | ✅              | Reasoning tokens emitted.                                     |
+| `high`   | ✅              | Reasoning tokens emitted.                                     |
+| `xhigh`  | ✅              | Highest tier the backend accepts.                            |
+| `max`    | ⚠️ clamped      | Backend rejects `max` (`400 Unexpected value 'max'`). The proxy clamps `max` → `xhigh` and logs it, so Copilot's "max" selector works instead of failing. |
+
+When reasoning is active (any level except `none`), the backend rejects
+`temperature`/`top_p`, so the proxy drops them. An explicit `none` is normalized
+away (the `reasoning` object is removed) so the backend doesn't reject it. The
+`max` → `xhigh` clamp lives in `clampEffort()` in `src/responses.ts`; remove it
+if Salesforce adds a distinct `max` tier.
 
 ## Configuration (`.env`)
 
@@ -243,7 +291,8 @@ routing: `sfdc_ai__DefaultBedrockAnthropic*` uses the Bedrock invoke path,
 ## Endpoints
 
 - `POST /v1/messages` — translated Anthropic Messages endpoint for Claude models (streaming and non-streaming).
-- `POST /v1/chat/completions` — translated OpenAI Chat Completions endpoint for GPT models (streaming and non-streaming).
+- `POST /v1/responses` — native OpenAI Responses endpoint for GPT models (streaming and non-streaming). Near-passthrough to Salesforce `/responses`; forwards `response.*` SSE frames verbatim.
+- `POST /v1/chat/completions` — translated OpenAI Chat Completions endpoint for GPT models (streaming and non-streaming); translates to/from Salesforce `/responses`.
 - `GET /health` — status + enabled model ids (both families).
 - `GET /v1/models` — combined model list (for clients that probe it).
 
