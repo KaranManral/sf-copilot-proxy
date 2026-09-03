@@ -150,6 +150,37 @@ function sfHeaders(token: string): Record<string, string> {
   };
 }
 
+// Node's fetch (undici) can hand back a pooled keep-alive socket that the
+// Salesforce edge already closed, or hang past its connect timeout — both seen
+// in production as ECONNRESET / UND_ERR_CONNECT_TIMEOUT on the *first* byte of
+// an otherwise-healthy request. These happen before any response is read, so
+// retrying here is invisible to the caller and is what makes Copilot's own
+// "Try Again" (which just resends the same request once, over the same
+// flaky path) actually succeed instead of failing again immediately.
+const TRANSIENT_FETCH_ERROR_RE = /ECONNRESET|ETIMEDOUT|EPIPE|UND_ERR_CONNECT_TIMEOUT|UND_ERR_SOCKET|fetch failed|terminated/i;
+
+function isTransientFetchError(err: unknown): boolean {
+  const msg = String((err as any)?.message ?? err);
+  const cause: any = (err as any)?.cause;
+  const causeMsg = cause ? String(cause.message ?? cause.code ?? cause) : "";
+  return TRANSIENT_FETCH_ERROR_RE.test(msg) || TRANSIENT_FETCH_ERROR_RE.test(causeMsg);
+}
+
+async function fetchUpstream(url: string, init: RequestInit, attempts = 3): Promise<Response> {
+  for (let attempt = 1; ; attempt++) {
+    try {
+      return await fetch(url, init);
+    } catch (err) {
+      if (attempt >= attempts || !isTransientFetchError(err)) throw err;
+      const delayMs = 300 * attempt;
+      console.error(
+        `[proxy] transient connect error (attempt ${attempt}/${attempts}), retrying in ${delayMs}ms: ${String((err as any)?.message || err)}`,
+      );
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+}
+
 function authorized(req: IncomingMessage): boolean {
   if (!config.proxyKey) return true; // no local key configured
   const auth = req.headers["authorization"];
@@ -199,7 +230,7 @@ async function handleMessages(req: IncomingMessage, res: ServerResponse): Promis
   const path = stream ? "invoke-with-response-stream" : "invoke";
   const url = `${config.modelsBaseUrl}/model/${alias}/${path}`;
 
-  const upstream = await fetch(url, {
+  const upstream = await fetchUpstream(url, {
     method: "POST",
     headers: sfHeaders(token),
     body: JSON.stringify(body),
@@ -375,7 +406,7 @@ async function handleChatCompletions(req: IncomingMessage, res: ServerResponse):
   const token = await tokens.get();
   const url = `${config.modelsBaseUrl}/responses`;
 
-  const upstream = await fetch(url, {
+  const upstream = await fetchUpstream(url, {
     method: "POST",
     headers: sfHeaders(token),
     body: JSON.stringify(stream ? { ...body, stream: true } : body),
@@ -478,7 +509,7 @@ async function handleResponses(req: IncomingMessage, res: ServerResponse): Promi
   const token = await tokens.get();
   const url = `${config.modelsBaseUrl}/responses`;
 
-  const upstream = await fetch(url, {
+  const upstream = await fetchUpstream(url, {
     method: "POST",
     headers: sfHeaders(token),
     body: JSON.stringify(stream ? { ...body, stream: true } : body),
@@ -580,7 +611,7 @@ async function handleChatCompletionsViaGenerations(
   const path = stream ? "chat/generations/stream" : "chat/generations";
   const url = `${config.modelsBaseUrl}/${path}`;
 
-  const upstream = await fetch(url, {
+  const upstream = await fetchUpstream(url, {
     method: "POST",
     headers: sfHeaders(token),
     body: JSON.stringify(body),
